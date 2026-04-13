@@ -308,36 +308,40 @@ if ltfV.size() > 0
                  text = txtValues))
 
             // --- Imbalance detection ---
-            if math.abs(getDeltaP) >= imbalanceP and getTotalVol > 0
-                getSign = math.sign(getDeltaP)
-                if getSign == 1
-                    stackBuyCount  += 1
-                    stackSellCount := 0
-                    maxBuyStack    := math.max(maxBuyStack, stackBuyCount)
+            // Пустые уровни пропускаем (не ломаем стек) — как в Python бэктесте
+            if getTotalVol > 0
+                if math.abs(getDeltaP) >= imbalanceP
+                    getSign = math.sign(getDeltaP)
+                    if getSign == 1
+                        stackBuyCount  += 1
+                        stackSellCount := 0
+                        maxBuyStack    := math.max(maxBuyStack, stackBuyCount)
+                    else
+                        stackSellCount += 1
+                        stackBuyCount  := 0
+                        maxSellStack   := math.max(maxSellStack, stackSellCount)
+
+                    [imbColor, txt] = switch getSign
+                        1 => [upCol, "𝅉"]
+                        =>   [dnCol, "𝅏"]
+
+                    imbalanceLab.push(label.new(bar_index + 1, math.avg(getLevel, getLevelNext),
+                         textcolor = chart.fg_color,
+                         text = txt, size = size.normal,
+                         color = #00000000, style = label.style_label_center,
+                         tooltip = str.tostring(getDeltaP, format.percent) + " Imbalance"))
+
+                    if stackBuyCount == stacked or stackSellCount == stacked
+                        for x = 0 to imbalanceLab.size() - 1
+                            imbalanceLab.get(x).set_textcolor(color.rgb(255, 243, 116))
+                    else if stackBuyCount > stacked or stackSellCount > stacked
+                        imbalanceLab.last().set_textcolor(color.rgb(255, 243, 116))
                 else
-                    stackSellCount += 1
+                    // Уровень с объёмом, но без imbalance — сброс стека
                     stackBuyCount  := 0
-                    maxSellStack   := math.max(maxSellStack, stackSellCount)
-
-                [imbColor, txt] = switch getSign
-                    1 => [upCol, "𝅉"]
-                    =>   [dnCol, "𝅏"]
-
-                imbalanceLab.push(label.new(bar_index + 1, math.avg(getLevel, getLevelNext),
-                     textcolor = chart.fg_color,
-                     text = txt, size = size.normal,
-                     color = #00000000, style = label.style_label_center,
-                     tooltip = str.tostring(getDeltaP, format.percent) + " Imbalance"))
-
-                if stackBuyCount == stacked or stackSellCount == stacked
-                    for x = 0 to imbalanceLab.size() - 1
-                        imbalanceLab.get(x).set_textcolor(color.rgb(255, 243, 116))
-                else if stackBuyCount > stacked or stackSellCount > stacked
-                    imbalanceLab.last().set_textcolor(color.rgb(255, 243, 116))
-            else
-                stackBuyCount  := 0
-                stackSellCount := 0
-                imbalanceLab.clear()
+                    stackSellCount := 0
+                    imbalanceLab.clear()
+            // getTotalVol == 0 → пустой уровень, НЕ сбрасываем стек (continue)
 
         // ═══════════════════════════════════════════════════════════
         // POC & VALUE AREA
@@ -445,7 +449,10 @@ if ltfV.size() > 0
             cooldownOk = bar_index - lastTradeBar >= cooldownBars
 
             // --- LONG SIGNAL ---
-            if posDirection == 0 and cooldownOk and hasStackedBuy
+            // Отдельный if (не else if!) чтобы short проверялся независимо
+            canEnter = posDirection == 0 and cooldownOk
+
+            if canEnter and hasStackedBuy
                 deltaOk = reqPosDelta ? totalDelta > 0 : true
                 pocOk   = reqPOCAlign ? pocPrice < close : true
 
@@ -471,8 +478,8 @@ if ltfV.size() > 0
                          color = longColor, textcolor = color.white,
                          style = label.style_label_up, size = size.small)
 
-            // --- SHORT SIGNAL ---
-            else if posDirection == 0 and cooldownOk and hasStackedSell
+            // --- SHORT SIGNAL (проверяется НЕЗАВИСИМО от long) ---
+            if canEnter and posDirection == 0 and hasStackedSell
                 deltaOk = reqPosDelta ? totalDelta < 0 : true
                 pocOk   = reqPOCAlign ? pocPrice > close : true
 
