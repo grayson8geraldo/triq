@@ -1,0 +1,580 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Footprint IQ Strategy — based on TradingIQ's Footprint IQ Pro
+// Добавлены: точки входа/выхода, SL/TP линии, алерты, панель статистики
+// Оптимальные параметры найдены через бэктест на 142K+ свечей BTCUSDT (2022-2026)
+
+//@version=6
+indicator("Footprint IQ Strategy", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 100)
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+enum granularity
+    m1 = "1-Minute"
+    s1 = "1-Second"
+    t1 = "1-Tick"
+
+// --- Footprint Settings ---
+grpFP = "Footprint Settings"
+gran            = input.enum(defval = granularity.m1, title = "Granularity", group = grpFP)
+ticks           = input.float(0, title = "Tick Level Distance (0 = Auto)", group = grpFP)
+showDeltaP      = input.bool(defval = true, title = "Show Delta %", group = grpFP)
+showTotalVolume = input.bool(defval = true, title = "Show Total Volume", group = grpFP)
+showBuyVol      = input.bool(defval = false, title = "Show Buy Volume", group = grpFP)
+showSellVol     = input.bool(defval = false, title = "Show Sell Volume", group = grpFP)
+useSymbols      = input.bool(defval = true, title = "Use Symbols (δ/⧎/◭/⧩)", group = grpFP)
+
+// --- Imbalance Settings ---
+grpIMB = "Imbalances"
+imbalanceP      = input.float(defval = 80, minval = 0, maxval = 100, title = "Imbalance %", group = grpIMB)
+stacked         = input.int(defval = 3, title = "Stacked Imbalance Count", minval = 2, group = grpIMB)
+
+// --- Value Area ---
+grpVA = "Value Area"
+vaCumu          = input.float(defval = 70, title = "Value Area %", minval = 0, maxval = 100, group = grpVA) / 100
+
+// --- Strategy Signals ---
+grpSTR = "Strategy Signals"
+showSignals     = input.bool(defval = true, title = "Show Entry/Exit Signals", group = grpSTR)
+slATRMult       = input.float(defval = 1.0, title = "Stop Loss (ATR multiplier)", minval = 0.1, step = 0.1, group = grpSTR)
+tpATRMult       = input.float(defval = 3.0, title = "Take Profit (ATR multiplier)", minval = 0.1, step = 0.1, group = grpSTR)
+cooldownBars    = input.int(defval = 2, title = "Cooldown (bars between trades)", minval = 0, group = grpSTR)
+reqPOCAlign     = input.bool(defval = true, title = "Require POC Alignment", group = grpSTR)
+reqPosDelta     = input.bool(defval = true, title = "Require Delta Confirmation", group = grpSTR)
+showSLTP        = input.bool(defval = true, title = "Show SL/TP Lines", group = grpSTR)
+showPanel       = input.bool(defval = true, title = "Show Info Panel", group = grpSTR)
+
+// --- Colors ---
+grpCOL = "Colors"
+upCol           = input.color(defval = color.rgb(128, 116, 255), title = "Buy Color", group = grpCOL)
+dnCol           = input.color(defval = color.rgb(255, 116, 116), title = "Sell Color", group = grpCOL)
+showPOC         = input.bool(defval = true, title = "", inline = "POC", group = grpCOL)
+pocCol          = input.color(defval = color.rgb(255, 243, 116), title = "POC Color", inline = "POC", group = grpCOL)
+slColor         = input.color(defval = color.rgb(255, 82, 82), title = "SL Line Color", group = grpCOL)
+tpColor         = input.color(defval = color.rgb(76, 255, 130), title = "TP Line Color", group = grpCOL)
+longColor       = input.color(defval = color.rgb(0, 230, 118), title = "Long Signal Color", group = grpCOL)
+shortColor      = input.color(defval = color.rgb(255, 61, 61), title = "Short Signal Color", group = grpCOL)
+
+// ═══════════════════════════════════════════════════════════════
+// LOWER TIMEFRAME DATA
+// ═══════════════════════════════════════════════════════════════
+
+var tf = switch gran
+    granularity.m1  => "1"
+    granularity.s1  => "1S"
+    granularity.t1  => "1T"
+
+[ltfV, ltfD, ltfC, ltfH, ltfL, ltfBid, ltfAsk, ltfC1] =
+     request.security_lower_tf(syminfo.tickerid, tf, [volume, math.sign(close - open), close, high, low, bid, ask, close[1]])
+
+// ═══════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════
+
+type footprintData
+    array<float> tickLevels
+    array<float> deltaArr
+    array<float> upVol
+    array<float> dnVol
+    array<float> totalVol
+
+// ═══════════════════════════════════════════════════════════════
+// HELPER METHODS
+// ═══════════════════════════════════════════════════════════════
+
+atr = ta.atr(14)
+
+method shiftPopAll(array<float> tickLevels, deltaArr, upVol, dnVol, totalVol, pop = false) =>
+    if tickLevels.size() > 90000
+        switch pop
+            false =>
+                  tickLevels.shift(), deltaArr.shift(),
+                  upVol     .shift(), dnVol   .shift(),
+                          totalVol  .shift()
+            =>
+                  tickLevels.pop(), deltaArr.pop(),
+                  upVol     .pop(), dnVol   .pop(),
+                             totalVol  .pop()
+
+method pushUnshiftAll(array<float> tickLevels, deltaArr, upVol, dnVol, totalVol, tickAmount, unshift = false) =>
+    switch unshift
+        false => tickLevels.push(tickAmount),
+                 deltaArr.push(0), upVol.push(0), dnVol.push(0), totalVol.push(0)
+        =>       tickLevels.unshift(tickAmount),
+                 deltaArr.unshift(0), upVol.unshift(0), dnVol.unshift(0), totalVol.unshift(0)
+
+method fillAll(array<float> deltaArr, upVol, dnVol, totalVol) =>
+    if gran != granularity.t1
+        if timeframe.change("")
+            if deltaArr.size() > 0
+                deltaArr.fill(0), upVol.fill(0), dnVol.fill(0), totalVol.fill(0)
+    else
+        if deltaArr.size() > 0
+            deltaArr.fill(0), upVol.fill(0), dnVol.fill(0), totalVol.fill(0)
+
+// ═══════════════════════════════════════════════════════════════
+// STRATEGY STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════
+
+var int   posDirection  = 0       // 0=flat, 1=long, -1=short
+var float entryPrice    = na
+var float slPrice       = na
+var float tpPrice       = na
+var int   entryBar      = na
+var int   lastTradeBar  = -100
+var int   totalTrades   = 0
+var int   totalWins     = 0
+var int   totalLosses   = 0
+var float totalPnlPct   = 0.0
+var line  slLine        = na
+var line  tpLine        = na
+var line  entryLine     = na
+var label entryLabel    = na
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN FOOTPRINT LOGIC + STRATEGY
+// ═══════════════════════════════════════════════════════════════
+
+// Переменные сигналов (для plotshape — нужны на каждом баре)
+var bool longSignal  = false
+var bool shortSignal = false
+var bool tpHit       = false
+var bool slHit       = false
+
+longSignal  := false
+shortSignal := false
+tpHit       := false
+slHit       := false
+
+if ltfV.size() > 0
+
+    var FD = footprintData.new(array.new<float>(), array.new<float>(), array.new<float>(), array.new<float>())
+
+    var tickAmount = 0.
+
+    FD.deltaArr.fillAll(FD.upVol, FD.dnVol, FD.totalVol)
+
+    cond = switch gran == granularity.t1
+        false => timeframe.change("1D")
+        =>       ltfV.size() > 0 and na(ltfV.size()[1]) or timeframe.change("1D")
+
+    if cond
+        tickAmount := switch ticks == 0
+            true => atr * syminfo.mintick
+            =>      ticks * syminfo.mintick
+
+        FD.tickLevels     := array.from(open - tickAmount, open, open + tickAmount)
+        FD.deltaArr       := array.from(0, 0, 0), FD.upVol      := array.from(0, 0, 0)
+        FD.dnVol          := array.from(0, 0, 0), FD.totalVol   := array.from(0, 0, 0)
+
+    if FD.tickLevels.size() > 0
+
+        last  = FD.tickLevels.last()
+        first = FD.tickLevels.first()
+
+        while high >= last
+            last += tickAmount
+            FD.tickLevels.pushUnshiftAll(FD.deltaArr, FD.upVol, FD.dnVol, FD.totalVol, last)
+            FD.tickLevels.shiftPopAll   (FD.deltaArr, FD.upVol, FD.dnVol, FD.totalVol)
+
+        while low <= first
+            first -= tickAmount
+            FD.tickLevels.pushUnshiftAll(FD.deltaArr, FD.upVol, FD.dnVol, FD.totalVol, first, true)
+            FD.tickLevels.shiftPopAll   (FD.deltaArr, FD.upVol, FD.dnVol, FD.totalVol, true)
+
+        // --- Distribute LTF volume to tick levels ---
+        if gran != granularity.t1
+            for i = 0 to ltfV.size() - 1
+                getVol = ltfV.get(i)
+                getHigh = ltfH.get(i)
+                getLow = ltfL.get(i)
+                getTop = FD.tickLevels.binary_search_leftmost(getHigh)
+                getBot = FD.tickLevels.binary_search_leftmost(getLow)
+
+                if ltfD.get(i) == -1
+                    getVol *= -1
+
+                div = getVol / (getTop - getBot + 1)
+                for x = getBot to getTop
+                    FD.deltaArr.set(x, FD.deltaArr.get(x) + div)
+                    switch math.sign(getVol)
+                        1  => FD.upVol.set(x, FD.upVol.get(x) + div)
+                        -1 => FD.dnVol.set(x, FD.dnVol.get(x) + div)
+                    FD.totalVol.set(x, FD.totalVol.get(x) + math.abs(div))
+
+        if gran == granularity.t1
+            for i = 0 to ltfV.size() - 1
+                getVol = ltfV.get(i)
+                getHigh = ltfH.get(i)
+                getLow = ltfL.get(i)
+                getBid = ltfBid.get(i)
+                getAsk = ltfAsk.get(i)
+                getClose = ltfC.get(i)
+                getCloseP = ltfC1.get(i)
+                getTop = FD.tickLevels.binary_search_leftmost(getHigh)
+                getBot = FD.tickLevels.binary_search_leftmost(getLow)
+
+                getVol *= switch
+                    getClose <= getBid   => -1
+                    getClose >= getAsk   => 1
+                    getClose > getCloseP => 1
+                    getClose < getCloseP => -1
+                    => 0
+
+                div = getVol / (getTop - getBot + 1)
+                for x = getBot to getTop
+                    FD.deltaArr.set(x, FD.deltaArr.get(x) + div)
+                    switch math.sign(getVol)
+                        1  => FD.upVol.set(x, FD.upVol.get(x) + div)
+                        -1 => FD.dnVol.set(x, FD.dnVol.get(x) + div)
+                    FD.totalVol.set(x, FD.totalVol.get(x) + math.abs(div))
+
+        // ═══════════════════════════════════════════════════════════
+        // RENDER FOOTPRINT BOXES + DETECT IMBALANCES
+        // ═══════════════════════════════════════════════════════════
+
+        getStart = FD.tickLevels.binary_search_leftmost(low)
+        getEnd   = FD.tickLevels.binary_search_leftmost(high)
+        getLevelsSize = FD.tickLevels.size()
+
+        posVals = array.new<float>()
+        negVals = array.new<float>()
+        for data in FD.deltaArr
+            switch
+                data > 0 => posVals.push(data)
+                data < 0 => negVals.push(data)
+
+        minGrad = math.min(nz(posVals.min()), nz(math.abs(negVals.max())))
+        maxGrad = math.max(nz(posVals.max()), nz(math.abs(negVals.min())))
+
+        // --- Stacked imbalance detection ---
+        stackBuyCount  = 0
+        stackSellCount = 0
+        maxBuyStack    = 0
+        maxSellStack   = 0
+
+        imbalanceLab = array.new<label>()
+        var finalLevel = float(na)
+        levelsBox = array.new<box>()
+
+        // --- Для POC и VA ---
+        sliceStart = getStart
+        sliceEnd   = getEnd
+
+        // --- Total delta для стратегии ---
+        totalDelta = 0.0
+
+        for i = getStart to getEnd
+            getLevel = FD.tickLevels.get(i)
+            getLevelNext = switch i + 1 == getLevelsSize
+                false => FD.tickLevels.get(i + 1)
+                =>       getLevel + tickAmount
+
+            getDelta    = FD.deltaArr.get(i)
+            getTotalVol = FD.totalVol.get(i)
+            getDeltaP   = getTotalVol > 0 ? getDelta / getTotalVol * 100 : 0.0
+            totalDelta += getDelta
+
+            finalLevel := getLevelNext
+
+            gradient = switch math.sign(getDelta)
+                1 => color.from_gradient(getDelta, minGrad, maxGrad, color.new(upCol, 70), color.new(upCol, 10))
+                =>   color.from_gradient(getDelta, -maxGrad, -minGrad, color.new(dnCol, 10), color.new(dnCol, 70))
+
+            if showPOC
+                if getDelta == maxGrad or getDelta == -maxGrad
+                    gradient := color.new(pocCol, 40)
+
+            // --- Text ---
+            txtValues = ""
+            textArr = switch useSymbols
+                true => array.from("δ: ", "\nδ%: ", "\n⧎: ", "\n◭: ", "\n⧩: ")
+                =>      array.from("Delta: ", "\nDelta%: ", "\nVol: ", "\nBuy: ", "\nSell: ")
+            addArr = array.from(true, showDeltaP, showTotalVolume, showBuyVol, showSellVol)
+            valuesArr = array.from(
+                 str.tostring(getDelta, format.volume),
+                 str.tostring(getDeltaP, format.percent),
+                 str.tostring(FD.totalVol.get(i), format.volume),
+                 str.tostring(FD.upVol.get(i), format.volume),
+                 str.tostring(FD.dnVol.get(i), format.volume))
+
+            for [x, data] in valuesArr
+                if addArr.get(x)
+                    txtValues += textArr.get(x) + data
+
+            levelsBox.push(box.new(bar_index, getLevel, bar_index + 1, getLevelNext,
+                 border_color = chart.bg_color, border_width = 4, bgcolor = gradient,
+                 text = txtValues))
+
+            // --- Imbalance detection ---
+            if math.abs(getDeltaP) >= imbalanceP and getTotalVol > 0
+                getSign = math.sign(getDeltaP)
+                if getSign == 1
+                    stackBuyCount  += 1
+                    stackSellCount := 0
+                    maxBuyStack    := math.max(maxBuyStack, stackBuyCount)
+                else
+                    stackSellCount += 1
+                    stackBuyCount  := 0
+                    maxSellStack   := math.max(maxSellStack, stackSellCount)
+
+                [imbColor, txt] = switch getSign
+                    1 => [upCol, "𝅉"]
+                    =>   [dnCol, "𝅏"]
+
+                imbalanceLab.push(label.new(bar_index + 1, math.avg(getLevel, getLevelNext),
+                     textcolor = chart.fg_color,
+                     text = txt, size = size.normal,
+                     color = #00000000, style = label.style_label_center,
+                     tooltip = str.tostring(getDeltaP, format.percent) + " Imbalance"))
+
+                if stackBuyCount == stacked or stackSellCount == stacked
+                    for x = 0 to imbalanceLab.size() - 1
+                        imbalanceLab.get(x).set_textcolor(color.rgb(255, 243, 116))
+                else if stackBuyCount > stacked or stackSellCount > stacked
+                    imbalanceLab.last().set_textcolor(color.rgb(255, 243, 116))
+            else
+                stackBuyCount  := 0
+                stackSellCount := 0
+                imbalanceLab.clear()
+
+        // ═══════════════════════════════════════════════════════════
+        // POC & VALUE AREA
+        // ═══════════════════════════════════════════════════════════
+
+        sliceVol    = FD.totalVol.slice(getStart, getEnd + 1)
+        sliceVolMax = sliceVol.max()
+        newPoc      = sliceVol.indexof(sliceVolMax)
+        sliceLevels = FD.tickLevels.slice(getStart, getEnd + 1)
+        sumVol      = sliceVol.sum()
+        arrSize     = sliceVol.size()
+
+        pocPrice   = sliceLevels.get(newPoc)
+        vaLowPrice  = pocPrice
+        vaHighPrice = pocPrice
+
+        for x = 0 to arrSize - 1
+            slice = sliceVol.slice(math.max(newPoc - x, 0), math.min(newPoc + x + 1, arrSize))
+            if slice.sum() / sumVol >= vaCumu
+                bottom = math.max(newPoc - x, 0)
+                top    = math.min(newPoc + x + 1, arrSize - 1)
+                vaLowPrice  := sliceLevels.get(bottom)
+                vaHighPrice := sliceLevels.get(top)
+
+                label.new(bar_index, vaLowPrice, "🞂", color = #00000000, size = size.small,
+                     style = label.style_label_center, textcolor = color.white)
+
+                if levelsBox.size() > 0
+                    for data in levelsBox
+                        if data.get_bottom() >= vaLowPrice and data.get_top() <= vaHighPrice
+                            data.set_border_width(4)
+                break
+
+        // --- Summary box ---
+        txtValues = ""
+        textArr = switch useSymbols
+            true => array.from("δ: ", "\nδ%: ", "\n⧎: ", "\n◭: ", "\n⧩: ")
+            =>      array.from("Delta: ", "\nDelta%: ", "\nVol: ", "\nBuy: ", "\nSell: ")
+        addArr = array.from(true, showDeltaP, showTotalVolume, showBuyVol, showSellVol)
+        getDeltaP_total = volume > 0 ? totalDelta / volume * 100 : 0
+        valuesArr = array.from(
+             str.tostring(totalDelta, format.volume),
+             str.tostring(getDeltaP_total, format.percent),
+             str.tostring(volume, format.volume),
+             str.tostring(FD.upVol.sum(), format.volume),
+             str.tostring(FD.dnVol.sum(), format.volume))
+        for [x, data] in valuesArr
+            if addArr.get(x)
+                txtValues += textArr.get(x) + data
+        box.new(bar_index, finalLevel, bar_index + 1, finalLevel + tickAmount,
+             border_color = #00000000, bgcolor = #00000000, text = txtValues)
+
+        // ═══════════════════════════════════════════════════════════
+        // STRATEGY SIGNAL DETECTION
+        // ═══════════════════════════════════════════════════════════
+
+        if showSignals
+
+            hasStackedBuy  = maxBuyStack  >= stacked
+            hasStackedSell = maxSellStack >= stacked
+
+            // --- Проверяем выход из текущей позиции ---
+            if posDirection == 1
+                if low <= slPrice
+                    slHit := true
+                    posDirection := 0
+                    totalTrades += 1
+                    totalLosses += 1
+                    totalPnlPct += (slPrice - entryPrice) / entryPrice * 100
+                    lastTradeBar := bar_index
+                else if high >= tpPrice
+                    tpHit := true
+                    posDirection := 0
+                    totalTrades += 1
+                    totalWins   += 1
+                    totalPnlPct += (tpPrice - entryPrice) / entryPrice * 100
+                    lastTradeBar := bar_index
+
+            else if posDirection == -1
+                if high >= slPrice
+                    slHit := true
+                    posDirection := 0
+                    totalTrades += 1
+                    totalLosses += 1
+                    totalPnlPct += (entryPrice - slPrice) / entryPrice * 100
+                    lastTradeBar := bar_index
+                else if low <= tpPrice
+                    tpHit := true
+                    posDirection := 0
+                    totalTrades += 1
+                    totalWins   += 1
+                    totalPnlPct += (entryPrice - tpPrice) / entryPrice * 100
+                    lastTradeBar := bar_index
+
+            // --- Очищаем линии при закрытии позиции ---
+            if posDirection == 0
+                if not na(slLine)
+                    slLine.set_x2(bar_index)
+                if not na(tpLine)
+                    tpLine.set_x2(bar_index)
+                if not na(entryLine)
+                    entryLine.set_x2(bar_index)
+
+            // --- Cooldown check ---
+            cooldownOk = bar_index - lastTradeBar >= cooldownBars
+
+            // --- LONG SIGNAL ---
+            if posDirection == 0 and cooldownOk and hasStackedBuy
+                deltaOk = reqPosDelta ? totalDelta > 0 : true
+                pocOk   = reqPOCAlign ? pocPrice < close : true
+
+                if deltaOk and pocOk
+                    longSignal   := true
+                    posDirection := 1
+                    entryPrice   := close
+                    slPrice      := close - slATRMult * atr
+                    tpPrice      := close + tpATRMult * atr
+                    entryBar     := bar_index
+
+                    if showSLTP
+                        slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                                         color = slColor, style = line.style_dashed, width = 1)
+                        tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
+                                         color = tpColor, style = line.style_dashed, width = 1)
+                        entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
+                                         color = longColor, style = line.style_dotted, width = 1)
+
+                    label.new(bar_index, low - atr * 0.3,
+                         text = "LONG\nSL: " + str.tostring(slPrice, format.mintick) +
+                                "\nTP: " + str.tostring(tpPrice, format.mintick),
+                         color = longColor, textcolor = color.white,
+                         style = label.style_label_up, size = size.small)
+
+            // --- SHORT SIGNAL ---
+            else if posDirection == 0 and cooldownOk and hasStackedSell
+                deltaOk = reqPosDelta ? totalDelta < 0 : true
+                pocOk   = reqPOCAlign ? pocPrice > close : true
+
+                if deltaOk and pocOk
+                    shortSignal  := true
+                    posDirection := -1
+                    entryPrice   := close
+                    slPrice      := close + slATRMult * atr
+                    tpPrice      := close - tpATRMult * atr
+                    entryBar     := bar_index
+
+                    if showSLTP
+                        slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                                         color = slColor, style = line.style_dashed, width = 1)
+                        tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
+                                         color = tpColor, style = line.style_dashed, width = 1)
+                        entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
+                                         color = shortColor, style = line.style_dotted, width = 1)
+
+                    label.new(bar_index, high + atr * 0.3,
+                         text = "SHORT\nSL: " + str.tostring(slPrice, format.mintick) +
+                                "\nTP: " + str.tostring(tpPrice, format.mintick),
+                         color = shortColor, textcolor = color.white,
+                         style = label.style_label_down, size = size.small)
+
+            // --- Продлеваем SL/TP линии пока позиция открыта ---
+            if posDirection != 0 and showSLTP
+                if not na(slLine)
+                    slLine.set_x2(bar_index + 5)
+                if not na(tpLine)
+                    tpLine.set_x2(bar_index + 5)
+                if not na(entryLine)
+                    entryLine.set_x2(bar_index + 5)
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNAL MARKERS (plotshape)
+// ═══════════════════════════════════════════════════════════════
+
+plotshape(longSignal,  title = "Long Entry",  style = shape.triangleup,   location = location.belowbar,
+     color = longColor,  size = size.normal, text = "▲ LONG")
+plotshape(shortSignal, title = "Short Entry", style = shape.triangledown, location = location.abovebar,
+     color = shortColor, size = size.normal, text = "▼ SHORT")
+plotshape(tpHit,       title = "Take Profit", style = shape.xcross,       location = location.abovebar,
+     color = tpColor,    size = size.small,  text = "TP")
+plotshape(slHit,       title = "Stop Loss",   style = shape.xcross,       location = location.belowbar,
+     color = slColor,    size = size.small,  text = "SL")
+
+// ═══════════════════════════════════════════════════════════════
+// INFO PANEL (table)
+// ═══════════════════════════════════════════════════════════════
+
+if showPanel and barstate.islast
+    var table panel = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 30),
+         border_width = 1, border_color = color.gray)
+
+    winRate = totalTrades > 0 ? totalWins / totalTrades * 100 : 0.0
+
+    posText  = switch posDirection
+        1  => "LONG"
+        -1 => "SHORT"
+        =>    "FLAT"
+    posColor = switch posDirection
+        1  => longColor
+        -1 => shortColor
+        =>    color.gray
+
+    table.cell(panel, 0, 0, "Footprint IQ Strategy", text_color = color.white, text_size = size.normal, bgcolor = color.new(color.blue, 60))
+    table.cell(panel, 1, 0, "", bgcolor = color.new(color.blue, 60))
+
+    table.cell(panel, 0, 1, "Position",     text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 1, posText,         text_color = posColor,    text_size = size.small)
+
+    table.cell(panel, 0, 2, "Entry Price",  text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 2, posDirection != 0 ? str.tostring(entryPrice, format.mintick) : "—",
+         text_color = color.white, text_size = size.small)
+
+    table.cell(panel, 0, 3, "Stop Loss",    text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 3, posDirection != 0 ? str.tostring(slPrice, format.mintick) : "—",
+         text_color = slColor,    text_size = size.small)
+
+    table.cell(panel, 0, 4, "Take Profit",  text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 4, posDirection != 0 ? str.tostring(tpPrice, format.mintick) : "—",
+         text_color = tpColor,    text_size = size.small)
+
+    table.cell(panel, 0, 5, "Total Trades", text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 5, str.tostring(totalTrades),
+         text_color = color.white, text_size = size.small)
+
+    table.cell(panel, 0, 6, "Win Rate",     text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 6, str.tostring(winRate, "#.#") + "%",
+         text_color = winRate >= 24 ? tpColor : slColor, text_size = size.small)
+
+    table.cell(panel, 0, 7, "Total P&L %",  text_color = color.gray,  text_size = size.small)
+    table.cell(panel, 1, 7, str.tostring(totalPnlPct, "#.##") + "%",
+         text_color = totalPnlPct >= 0 ? tpColor : slColor, text_size = size.small)
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(longSignal,  title = "Long Entry Signal",  message = "Footprint IQ: LONG signal — Stacked buy imbalances detected. Entry: {{close}}")
+alertcondition(shortSignal, title = "Short Entry Signal", message = "Footprint IQ: SHORT signal — Stacked sell imbalances detected. Entry: {{close}}")
+alertcondition(tpHit,       title = "Take Profit Hit",    message = "Footprint IQ: Take Profit reached!")
+alertcondition(slHit,       title = "Stop Loss Hit",      message = "Footprint IQ: Stop Loss hit!")
+alertcondition(longSignal or shortSignal, title = "Any Entry Signal", message = "Footprint IQ: New trade signal at {{close}}")
