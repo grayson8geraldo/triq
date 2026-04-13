@@ -132,6 +132,11 @@ var line  tpLine        = na
 var line  entryLine     = na
 var label entryLabel    = na
 
+// Pending signal — сигнал найден, ждём следующий бар для входа
+var int   pendingSignal = 0      // 0=none, 1=pending long, -1=pending short
+var float pendingSL     = na
+var float pendingTP     = na
+
 // ═══════════════════════════════════════════════════════════════
 // MAIN FOOTPRINT LOGIC + STRATEGY
 // ═══════════════════════════════════════════════════════════════
@@ -396,6 +401,8 @@ if ltfV.size() > 0
 
         // ═══════════════════════════════════════════════════════════
         // STRATEGY SIGNAL DETECTION
+        // Логика: сигнал на текущем баре → ВХОД на открытии следующего
+        // Это решает проблему "свеча уже ушла"
         // ═══════════════════════════════════════════════════════════
 
         if showSignals
@@ -403,7 +410,61 @@ if ltfV.size() > 0
             hasStackedBuy  = maxBuyStack  >= stacked
             hasStackedSell = maxSellStack >= stacked
 
-            // --- Проверяем выход из текущей позиции ---
+            // ──────────────────────────────────────────────────────
+            // 1. ИСПОЛНЯЕМ PENDING СИГНАЛ (вход на open текущего бара)
+            //    Сигнал был найден на ПРЕДЫДУЩЕМ баре, входим по open
+            // ──────────────────────────────────────────────────────
+            if pendingSignal == 1 and posDirection == 0
+                longSignal   := true
+                posDirection := 1
+                entryPrice   := open   // Вход по OPEN, не по close!
+                slPrice      := open - pendingSL
+                tpPrice      := open + pendingTP
+                entryBar     := bar_index
+                pendingSignal := 0
+
+                if showSLTP
+                    slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                                     color = slColor, style = line.style_dashed, width = 2)
+                    tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
+                                     color = tpColor, style = line.style_dashed, width = 2)
+                    entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
+                                     color = longColor, style = line.style_solid, width = 1)
+
+                label.new(bar_index, low - atr * 0.3,
+                     text = "► LONG ENTRY\n@ " + str.tostring(entryPrice, format.mintick) +
+                            "\nSL: " + str.tostring(slPrice, format.mintick) +
+                            "\nTP: " + str.tostring(tpPrice, format.mintick),
+                     color = longColor, textcolor = color.white,
+                     style = label.style_label_up, size = size.small)
+
+            else if pendingSignal == -1 and posDirection == 0
+                shortSignal  := true
+                posDirection := -1
+                entryPrice   := open
+                slPrice      := open + pendingSL
+                tpPrice      := open - pendingTP
+                entryBar     := bar_index
+                pendingSignal := 0
+
+                if showSLTP
+                    slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
+                                     color = slColor, style = line.style_dashed, width = 2)
+                    tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
+                                     color = tpColor, style = line.style_dashed, width = 2)
+                    entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
+                                     color = shortColor, style = line.style_solid, width = 1)
+
+                label.new(bar_index, high + atr * 0.3,
+                     text = "► SHORT ENTRY\n@ " + str.tostring(entryPrice, format.mintick) +
+                            "\nSL: " + str.tostring(slPrice, format.mintick) +
+                            "\nTP: " + str.tostring(tpPrice, format.mintick),
+                     color = shortColor, textcolor = color.white,
+                     style = label.style_label_down, size = size.small)
+
+            // ──────────────────────────────────────────────────────
+            // 2. ПРОВЕРЯЕМ SL/TP ОТКРЫТОЙ ПОЗИЦИИ
+            // ──────────────────────────────────────────────────────
             if posDirection == 1
                 if low <= slPrice
                     slHit := true
@@ -437,7 +498,7 @@ if ltfV.size() > 0
                     lastTradeBar := bar_index
 
             // --- Очищаем линии при закрытии позиции ---
-            if posDirection == 0
+            if posDirection == 0 and pendingSignal == 0
                 if not na(slLine)
                     slLine.set_x2(bar_index)
                 if not na(tpLine)
@@ -445,65 +506,44 @@ if ltfV.size() > 0
                 if not na(entryLine)
                     entryLine.set_x2(bar_index)
 
-            // --- Cooldown check ---
+            // ──────────────────────────────────────────────────────
+            // 3. ДЕТЕКТИМ НОВЫЙ СИГНАЛ → ставим в pending
+            //    На графике показываем стрелку "ГОТОВЬСЯ"
+            //    Вход будет на open следующего бара
+            // ──────────────────────────────────────────────────────
             cooldownOk = bar_index - lastTradeBar >= cooldownBars
+            canEnter = posDirection == 0 and cooldownOk and pendingSignal == 0
 
-            // --- LONG SIGNAL ---
-            // Отдельный if (не else if!) чтобы short проверялся независимо
-            canEnter = posDirection == 0 and cooldownOk
-
+            // --- LONG SETUP ---
             if canEnter and hasStackedBuy
                 deltaOk = reqPosDelta ? totalDelta > 0 : true
                 pocOk   = reqPOCAlign ? pocPrice < close : true
 
                 if deltaOk and pocOk
-                    longSignal   := true
-                    posDirection := 1
-                    entryPrice   := close
-                    slPrice      := close - slATRMult * atr
-                    tpPrice      := close + tpATRMult * atr
-                    entryBar     := bar_index
+                    pendingSignal := 1
+                    pendingSL     := slATRMult * atr   // Сохраняем расстояние, не цену
+                    pendingTP     := tpATRMult * atr
 
-                    if showSLTP
-                        slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
-                                         color = slColor, style = line.style_dashed, width = 1)
-                        tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
-                                         color = tpColor, style = line.style_dashed, width = 1)
-                        entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
-                                         color = longColor, style = line.style_dotted, width = 1)
+                    // Предварительная метка "готовься"
+                    label.new(bar_index, low - atr * 0.5,
+                         text = "⚑ LONG SETUP\nВход на след. свече",
+                         color = color.new(longColor, 40), textcolor = color.white,
+                         style = label.style_label_up, size = size.tiny)
 
-                    label.new(bar_index, low - atr * 0.3,
-                         text = "LONG\nSL: " + str.tostring(slPrice, format.mintick) +
-                                "\nTP: " + str.tostring(tpPrice, format.mintick),
-                         color = longColor, textcolor = color.white,
-                         style = label.style_label_up, size = size.small)
-
-            // --- SHORT SIGNAL (проверяется НЕЗАВИСИМО от long) ---
-            if canEnter and posDirection == 0 and hasStackedSell
+            // --- SHORT SETUP ---
+            if canEnter and pendingSignal == 0 and hasStackedSell
                 deltaOk = reqPosDelta ? totalDelta < 0 : true
                 pocOk   = reqPOCAlign ? pocPrice > close : true
 
                 if deltaOk and pocOk
-                    shortSignal  := true
-                    posDirection := -1
-                    entryPrice   := close
-                    slPrice      := close + slATRMult * atr
-                    tpPrice      := close - tpATRMult * atr
-                    entryBar     := bar_index
+                    pendingSignal := -1
+                    pendingSL     := slATRMult * atr
+                    pendingTP     := tpATRMult * atr
 
-                    if showSLTP
-                        slLine    := line.new(bar_index, slPrice, bar_index + 20, slPrice,
-                                         color = slColor, style = line.style_dashed, width = 1)
-                        tpLine    := line.new(bar_index, tpPrice, bar_index + 20, tpPrice,
-                                         color = tpColor, style = line.style_dashed, width = 1)
-                        entryLine := line.new(bar_index, entryPrice, bar_index + 20, entryPrice,
-                                         color = shortColor, style = line.style_dotted, width = 1)
-
-                    label.new(bar_index, high + atr * 0.3,
-                         text = "SHORT\nSL: " + str.tostring(slPrice, format.mintick) +
-                                "\nTP: " + str.tostring(tpPrice, format.mintick),
-                         color = shortColor, textcolor = color.white,
-                         style = label.style_label_down, size = size.small)
+                    label.new(bar_index, high + atr * 0.5,
+                         text = "⚑ SHORT SETUP\nВход на след. свече",
+                         color = color.new(shortColor, 40), textcolor = color.white,
+                         style = label.style_label_down, size = size.tiny)
 
             // --- Продлеваем SL/TP линии пока позиция открыта ---
             if posDirection != 0 and showSLTP
@@ -580,8 +620,14 @@ if showPanel and barstate.islast
 // ALERTS
 // ═══════════════════════════════════════════════════════════════
 
-alertcondition(longSignal,  title = "Long Entry Signal",  message = "Footprint IQ: LONG signal — Stacked buy imbalances detected. Entry: {{close}}")
-alertcondition(shortSignal, title = "Short Entry Signal", message = "Footprint IQ: SHORT signal — Stacked sell imbalances detected. Entry: {{close}}")
-alertcondition(tpHit,       title = "Take Profit Hit",    message = "Footprint IQ: Take Profit reached!")
-alertcondition(slHit,       title = "Stop Loss Hit",      message = "Footprint IQ: Stop Loss hit!")
-alertcondition(longSignal or shortSignal, title = "Any Entry Signal", message = "Footprint IQ: New trade signal at {{close}}")
+// Алерт на SETUP (готовься — вход на следующей свече)
+setupDetected = pendingSignal != 0 and pendingSignal != nz(pendingSignal[1])
+alertcondition(setupDetected and pendingSignal ==  1, title = "Long Setup (enter next bar)",  message = "Footprint IQ: LONG SETUP — enter at OPEN of next 4H candle!")
+alertcondition(setupDetected and pendingSignal == -1, title = "Short Setup (enter next bar)", message = "Footprint IQ: SHORT SETUP — enter at OPEN of next 4H candle!")
+
+// Алерт на фактический ВХОД
+alertcondition(longSignal,  title = "Long Entry Executed",  message = "Footprint IQ: LONG entered at {{open}}")
+alertcondition(shortSignal, title = "Short Entry Executed", message = "Footprint IQ: SHORT entered at {{open}}")
+alertcondition(tpHit,       title = "Take Profit Hit",      message = "Footprint IQ: TP reached!")
+alertcondition(slHit,       title = "Stop Loss Hit",        message = "Footprint IQ: SL hit!")
+alertcondition(longSignal or shortSignal, title = "Any Entry", message = "Footprint IQ: Trade entered at {{open}}")
