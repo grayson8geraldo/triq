@@ -75,6 +75,11 @@ class FootprintProfile:
     session_high: float = 0.0
     session_low: float = 0.0
     delta_pct_range: Tuple[float, float] = (0.0, 0.0)
+    # Зоны stacked imbalances (для pullback-стратегии)
+    buy_zone_low: float = 0.0    # Нижняя граница зоны покупок
+    buy_zone_high: float = 0.0   # Верхняя граница зоны покупок
+    sell_zone_low: float = 0.0   # Нижняя граница зоны продаж
+    sell_zone_high: float = 0.0  # Верхняя граница зоны продаж
 
 
 def build_footprint_pine(candles: pd.DataFrame, tick_size: float,
@@ -183,28 +188,51 @@ def build_footprint_pine(candles: pd.DataFrame, tick_size: float,
                 va_high_price = levels[hi]
                 break
 
-    # --- Stacked Imbalances ---
+    # --- Stacked Imbalances + Zone Detection ---
     max_buy_stack = 0
     max_sell_stack = 0
     cur_buy = 0
     cur_sell = 0
+    cur_buy_start = 0
+    cur_sell_start = 0
+
+    # Лучшие (самые длинные) зоны
+    best_buy_start = 0
+    best_buy_end = 0
+    best_sell_start = 0
+    best_sell_end = 0
 
     for i in range(n_levels):
         dp = delta_pct[i]
         if total_vol[i] <= 0:
-            # Пропускаем пустые уровни (не ломаем стек)
             continue
         if dp >= imbalance_pct:
+            if cur_buy == 0:
+                cur_buy_start = i
             cur_buy += 1
             cur_sell = 0
-            max_buy_stack = max(max_buy_stack, cur_buy)
+            if cur_buy > max_buy_stack:
+                max_buy_stack = cur_buy
+                best_buy_start = cur_buy_start
+                best_buy_end = i
         elif dp <= -imbalance_pct:
+            if cur_sell == 0:
+                cur_sell_start = i
             cur_sell += 1
             cur_buy = 0
-            max_sell_stack = max(max_sell_stack, cur_sell)
+            if cur_sell > max_sell_stack:
+                max_sell_stack = cur_sell
+                best_sell_start = cur_sell_start
+                best_sell_end = i
         else:
             cur_buy = 0
             cur_sell = 0
+
+    # Ценовые зоны stacked imbalances
+    buy_zone_low = levels[best_buy_start] if max_buy_stack >= stacked_count else 0.0
+    buy_zone_high = levels[min(best_buy_end + 1, n_levels - 1)] if max_buy_stack >= stacked_count else 0.0
+    sell_zone_low = levels[best_sell_start] if max_sell_stack >= stacked_count else 0.0
+    sell_zone_high = levels[min(best_sell_end + 1, n_levels - 1)] if max_sell_stack >= stacked_count else 0.0
 
     # --- Delta Lines ---
     close_idx = min(np.searchsorted(levels, sess_close, side="left"), n_levels - 1)
@@ -234,6 +262,10 @@ def build_footprint_pine(candles: pd.DataFrame, tick_size: float,
         highest_neg_delta_above=highest_neg_above,
         session_open=sess_open,
         session_close=sess_close,
+        buy_zone_low=buy_zone_low,
+        buy_zone_high=buy_zone_high,
+        sell_zone_low=sell_zone_low,
+        sell_zone_high=sell_zone_high,
         session_high=sess_high,
         session_low=sess_low,
         delta_pct_range=pct_range,
@@ -323,32 +355,26 @@ def close_position(pos: Trade, exit_price: float, exit_time, reason: str) -> flo
 
 def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
                  session_tf: str = "4h",
-                 imbalance_pct: float = 70.0,
+                 imbalance_pct: float = 80.0,
                  stacked_count: int = 3,
                  va_pct: float = 0.70,
                  risk_per_trade: float = 0.03,
-                 sl_atr_mult: float = 1.0,
+                 sl_atr_mult: float = 0.5,
                  tp_atr_mult: float = 2.0,
                  max_leverage: float = 10.0,
                  commission_pct: float = 0.04,
-                 ema_period: int = 50,
-                 cooldown_sessions: int = 2,
-                 delta_strength_mult: float = 1.5) -> BacktestResult:
+                 zone_expiry: int = 12,
+                 max_zones: int = 3) -> BacktestResult:
     """
-    Стратегия Footprint IQ с фильтрами:
+    PULLBACK-TO-ZONES стратегия:
 
-    Фильтры:
-      1. Трендовый: EMA-50 на сессионных closes (long выше EMA, short ниже)
-      2. Сила delta: |total_delta| > median(|delta| за последние N сессий) × mult
-      3. POC alignment: для long POC ниже close, для short POC выше close
-      4. Cooldown: минимум N сессий между сделками
-      5. Stacked imbalance (основной сигнал из индикатора)
+    1. Строим footprint → находим зоны stacked imbalances (уровни поддержки/сопротивления)
+    2. Запоминаем зоны, ждём
+    3. Когда цена ОТКАТЫВАЕТ к зоне покупок → LONG (покупка от поддержки)
+    4. Когда цена ОТКАТЫВАЕТ к зоне продаж → SHORT (продажа от сопротивления)
+    5. SL за зоной, TP = ATR × множитель
 
-    Вход Long:
-      - Stacked buy imbalances + delta > 0 + цена > EMA + POC < close + сильный delta
-
-    Вход Short:
-      - Stacked sell imbalances + delta < 0 + цена < EMA + POC > close + сильный delta
+    Преимущество: входим на откате, а не на импульсе.
     """
 
     data = data.copy()
@@ -357,7 +383,6 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
     sess_groups = data.groupby("session")
     sess_keys = sorted(sess_groups.groups.keys())
 
-    # Предвычисляем ATR и closes на сессионных свечах
     sess_ohlcv = []
     for sk in sess_keys:
         g = sess_groups.get_group(sk)
@@ -372,14 +397,6 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
     sess_atr = compute_atr_series(sess_df["high"].values, sess_df["low"].values,
                                    sess_df["close"].values, period=14)
 
-    # EMA на сессионных closes
-    sess_closes = sess_df["close"].values
-    ema = np.zeros(len(sess_closes))
-    ema[0] = sess_closes[0]
-    k = 2.0 / (ema_period + 1)
-    for i in range(1, len(sess_closes)):
-        ema[i] = sess_closes[i] * k + ema[i - 1] * (1 - k)
-
     balance = initial_balance
     trades: List[Trade] = []
     equity_curve = [(data["datetime"].iloc[0], balance)]
@@ -390,22 +407,21 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
 
     n_sessions = len(sess_keys)
     signals_generated = 0
-    signals_filtered = 0
-    last_trade_idx = -100  # Для cooldown
+    zones_created = 0
 
-    # Скользящее окно абс. delta для определения "силы"
-    delta_history: List[float] = []
+    # Активные зоны поддержки/сопротивления
+    # Каждая зона: (low, high, direction, creation_session_idx, delta_strength)
+    active_zones: List[Tuple[float, float, str, int, float]] = []
 
     print(f"{'='*80}")
-    print(f"  FOOTPRINT IQ PRO BACKTESTER (with filters)")
+    print(f"  FOOTPRINT IQ — PULLBACK TO ZONES STRATEGY")
     print(f"  Начальный баланс: ${initial_balance:.2f}")
     print(f"  Данные: {data['datetime'].iloc[0]} → {data['datetime'].iloc[-1]}")
     print(f"  Сессий: {n_sessions} ({session_tf})")
     print(f"  Imbalance: {imbalance_pct}% | Stacked: {stacked_count}")
     print(f"  Risk: {risk_per_trade*100}% | SL: {sl_atr_mult}×ATR | TP: {tp_atr_mult}×ATR")
     print(f"  Leverage: {max_leverage}x | Commission: {commission_pct}%")
-    print(f"  Filters: EMA-{ema_period}, cooldown={cooldown_sessions}, "
-          f"delta_strength={delta_strength_mult}x")
+    print(f"  Zone expiry: {zone_expiry} sessions | Max zones: {max_zones}")
     print(f"{'='*80}")
 
     for s_idx in range(n_sessions):
@@ -423,27 +439,32 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
 
         tick_size = atr / 20
 
-        # --- Проверяем SL/TP открытой позиции свеча за свечой ---
-        if current_pos is not None:
-            closed = False
-            for _, candle in sess_candles.iterrows():
+        # --- Удаляем просроченные зоны ---
+        active_zones = [z for z in active_zones if s_idx - z[3] <= zone_expiry]
+
+        # --- Проверяем SL/TP и PULLBACK TO ZONE свеча за свечой ---
+        for _, candle in sess_candles.iterrows():
+            c_high = candle["high"]
+            c_low = candle["low"]
+            c_close = candle["close"]
+            c_time = candle["datetime"]
+
+            # 1. Проверяем SL/TP открытой позиции
+            if current_pos is not None:
+                closed = False
                 if current_pos.direction == "long":
-                    if candle["low"] <= current_pos.sl_price:
-                        close_position(current_pos, current_pos.sl_price,
-                                       candle["datetime"], "SL")
+                    if c_low <= current_pos.sl_price:
+                        close_position(current_pos, current_pos.sl_price, c_time, "SL")
                         closed = True
-                    elif candle["high"] >= current_pos.tp_price:
-                        close_position(current_pos, current_pos.tp_price,
-                                       candle["datetime"], "TP")
+                    elif c_high >= current_pos.tp_price:
+                        close_position(current_pos, current_pos.tp_price, c_time, "TP")
                         closed = True
                 else:
-                    if candle["high"] >= current_pos.sl_price:
-                        close_position(current_pos, current_pos.sl_price,
-                                       candle["datetime"], "SL")
+                    if c_high >= current_pos.sl_price:
+                        close_position(current_pos, current_pos.sl_price, c_time, "SL")
                         closed = True
-                    elif candle["low"] <= current_pos.tp_price:
-                        close_position(current_pos, current_pos.tp_price,
-                                       candle["datetime"], "TP")
+                    elif c_low <= current_pos.tp_price:
+                        close_position(current_pos, current_pos.tp_price, c_time, "TP")
                         closed = True
 
                 if closed:
@@ -452,18 +473,68 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
                     balance += current_pos.pnl
                     balance = max(balance, 0)
                     trades.append(current_pos)
-                    equity_curve.append((candle["datetime"], balance))
+                    equity_curve.append((c_time, balance))
 
                     peak_balance = max(peak_balance, balance)
                     if peak_balance > 0:
                         dd = (peak_balance - balance) / peak_balance
                         max_dd = max(max_dd, dd)
-
                     current_pos = None
-                    last_trade_idx = s_idx
-                    break
 
-        # --- Строим footprint ---
+            # 2. Проверяем откат к зонам (PULLBACK ENTRY)
+            if current_pos is None and balance > 1.0 and s_idx >= 14:
+                for zone in active_zones:
+                    z_low, z_high, z_dir, z_created, z_delta = zone
+
+                    if z_dir == "support":
+                        # Цена дошла до зоны И закрылась ВЫШЕ неё → подтверждённый отскок → LONG
+                        if c_low <= z_high and c_close > z_high:
+                            entry_price = c_close
+                            sl_price = z_low - sl_atr_mult * atr
+                            tp_price = entry_price + tp_atr_mult * atr
+
+                            sl_dist = abs(entry_price - sl_price)
+                            if sl_dist <= 0:
+                                continue
+                            risk_usd = balance * risk_per_trade
+                            pos_size = risk_usd / (sl_dist / entry_price)
+                            pos_size = min(pos_size, balance * max_leverage)
+
+                            current_pos = Trade(
+                                entry_time=c_time, direction="long",
+                                entry_price=entry_price,
+                                sl_price=sl_price, tp_price=tp_price,
+                                size_usd=pos_size,
+                            )
+                            signals_generated += 1
+                            active_zones.remove(zone)  # Зона отработана
+                            break
+
+                    elif z_dir == "resistance":
+                        # Цена дошла до зоны И закрылась НИЖЕ неё → подтверждённый отскок → SHORT
+                        if c_high >= z_low and c_close < z_low:
+                            entry_price = c_close
+                            sl_price = z_high + sl_atr_mult * atr
+                            tp_price = entry_price - tp_atr_mult * atr
+
+                            sl_dist = abs(entry_price - sl_price)
+                            if sl_dist <= 0:
+                                continue
+                            risk_usd = balance * risk_per_trade
+                            pos_size = risk_usd / (sl_dist / entry_price)
+                            pos_size = min(pos_size, balance * max_leverage)
+
+                            current_pos = Trade(
+                                entry_time=c_time, direction="short",
+                                entry_price=entry_price,
+                                sl_price=sl_price, tp_price=tp_price,
+                                size_usd=pos_size,
+                            )
+                            signals_generated += 1
+                            active_zones.remove(zone)
+                            break
+
+        # --- Строим footprint и добавляем новые зоны ---
         profile = build_footprint_pine(
             sess_candles, tick_size,
             imbalance_pct=imbalance_pct,
@@ -471,75 +542,29 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
             va_pct=va_pct
         )
 
-        # Обновляем историю delta
-        delta_history.append(abs(profile.total_delta))
-        if len(delta_history) > 200:
-            delta_history.pop(0)
+        # Зоны строим на основе POC и VA (реальные уровни объёма)
+        # Stacked buy → бычья сессия → VA_LOW = поддержка для pullback long
+        if profile.has_stacked_buy and profile.total_delta > 0:
+            zone_mid = profile.poc_price
+            zone_width = tick_size * 2
+            zones_created += 1
+            active_zones.append((
+                profile.va_low - zone_width, profile.va_low + zone_width,
+                "support", s_idx, profile.total_delta
+            ))
 
-        # --- Генерируем сигнал с фильтрами ---
-        if current_pos is None and balance > 1.0 and s_idx >= ema_period:
-            signal = None
-            sess_close = profile.session_close
-            ema_val = ema[s_idx]
+        # Stacked sell → медвежья сессия → VA_HIGH = сопротивление для pullback short
+        if profile.has_stacked_sell and profile.total_delta < 0:
+            zone_width = tick_size * 2
+            zones_created += 1
+            active_zones.append((
+                profile.va_high - zone_width, profile.va_high + zone_width,
+                "resistance", s_idx, profile.total_delta
+            ))
 
-            # Фильтр cooldown
-            if s_idx - last_trade_idx < cooldown_sessions:
-                continue
-
-            # Фильтр силы delta
-            median_delta = float(np.median(delta_history)) if delta_history else 0
-            delta_strong = abs(profile.total_delta) > median_delta * delta_strength_mult
-
-            # === LONG ===
-            if (profile.has_stacked_buy
-                    and profile.total_delta > 0
-                    and sess_close > ema_val         # Тренд вверх
-                    and profile.poc_price < sess_close  # POC ниже цены (поддержка)
-                    and delta_strong):
-                signal = "long"
-
-            # === SHORT ===
-            elif (profile.has_stacked_sell
-                  and profile.total_delta < 0
-                  and sess_close < ema_val           # Тренд вниз
-                  and profile.poc_price > sess_close  # POC выше цены (сопротивление)
-                  and delta_strong):
-                signal = "short"
-
-            if profile.has_stacked_buy or profile.has_stacked_sell:
-                signals_filtered += 1  # Считаем отфильтрованные
-
-            if signal is not None:
-                signals_generated += 1
-                entry_price = sess_close
-
-                if signal == "long":
-                    # SL ниже VA_low или ATR-based, что ближе
-                    sl_price = entry_price - sl_atr_mult * atr
-                    if profile.va_low < entry_price:
-                        sl_price = max(sl_price, profile.va_low - tick_size)
-                    tp_price = entry_price + tp_atr_mult * atr
-                else:
-                    sl_price = entry_price + sl_atr_mult * atr
-                    if profile.va_high > entry_price:
-                        sl_price = min(sl_price, profile.va_high + tick_size)
-                    tp_price = entry_price - tp_atr_mult * atr
-
-                sl_distance = abs(entry_price - sl_price)
-                if sl_distance <= 0:
-                    continue
-                risk_usd = balance * risk_per_trade
-                pos_size = risk_usd / (sl_distance / entry_price)
-                pos_size = min(pos_size, balance * max_leverage)
-
-                current_pos = Trade(
-                    entry_time=sess_candles["datetime"].iloc[-1],
-                    direction=signal,
-                    entry_price=entry_price,
-                    sl_price=sl_price,
-                    tp_price=tp_price,
-                    size_usd=pos_size,
-                )
+        # Ограничиваем количество зон
+        if len(active_zones) > max_zones * 2:
+            active_zones = active_zones[-max_zones * 2:]
 
     # Закрываем открытую позицию
     if current_pos is not None:
@@ -553,8 +578,8 @@ def run_backtest(data: pd.DataFrame, initial_balance: float = 200.0,
         trades.append(current_pos)
         equity_curve.append((data["datetime"].iloc[-1], balance))
 
-    print(f"\n  Stacked imbalance сессий (до фильтров): {signals_filtered}")
-    print(f"  Сигналов после фильтров:                {signals_generated}")
+    print(f"\n  Зон создано:       {zones_created}")
+    print(f"  Входов по откату:  {signals_generated}")
 
     # --- Собираем статистику ---
     result = BacktestResult(
@@ -717,22 +742,21 @@ def main():
 
     print("\nЗапуск бэктеста Footprint IQ Pro...\n")
 
-    # Оптимальные параметры (найдены через parameter sweep)
+    # Pullback-to-VA-zones стратегия (оптимальные параметры)
     result = run_backtest(
         data,
         initial_balance=200.0,
-        session_tf="4h",           # 4H footprint сессии
-        imbalance_pct=80.0,        # 80% порог imbalance (строже → качественнее)
-        stacked_count=3,           # 3+ подряд imbalance уровня
+        session_tf="4h",
+        imbalance_pct=80.0,        # 80% порог imbalance
+        stacked_count=3,           # 3+ подряд уровня
         va_pct=0.70,               # Value Area 70%
         risk_per_trade=0.03,       # 3% от баланса на сделку
-        sl_atr_mult=1.0,           # SL = 1× ATR
-        tp_atr_mult=3.0,           # TP = 3× ATR (RR = 3.0, даём прибыли расти)
+        sl_atr_mult=1.8,           # SL = зона + 1.8×ATR (широкий, даёт пространство)
+        tp_atr_mult=4.0,           # TP = 4×ATR (большой RR, даём прибыли расти)
         max_leverage=10.0,         # Макс. леверидж 10x
-        commission_pct=0.04,       # 0.04% комиссия (Binance Futures)
-        ema_period=3,              # Фактически без EMA фильтра
-        cooldown_sessions=2,       # Мин. 2 сессии между сделками
-        delta_strength_mult=0.5,   # Минимальный фильтр силы delta
+        commission_pct=0.04,       # Binance Futures комиссия
+        zone_expiry=36,            # Зона живёт 36 сессий (~6 дней)
+        max_zones=2,               # Макс. 2 активных зоны в каждую сторону
     )
 
     print_report(result)
